@@ -45,8 +45,10 @@ def _secret(key, default):
 
 
 KOBO_SERVER = _secret("KOBO_SERVER", "https://kf.kobotoolbox.org")  # <-- your Kobo server
-KOBO_API_TOKEN = _secret("KOBO_API_TOKEN", "YOUR_KOBO_API_TOKEN")  # <-- placeholder: API key
-KOBO_ASSET_UID = _secret("KOBO_ASSET_UID", "YOUR_FORM_ASSET_UID")  # <-- placeholder: form ID
+KOBO_API_TOKEN = _secret("KOBO_API_TOKEN", "")  # API key: put in .streamlit/secrets.toml, NOT in this file
+KOBO_ASSET_UID = _secret("KOBO_ASSET_UID", "aJ5SsJRgzQw6UtpNtH63V2")  # form ID (not secret)
+KOBO_FALLBACK_SERVERS = ["https://kf.kobotoolbox.org", "https://eu.kobotoolbox.org",
+                         "https://kobo.humanitarianresponse.info"]  # tried automatically if the first fails
 APP_PASSWORD = _secret("APP_PASSWORD", "")  # optional access code (recommended)
 
 CASE_ID_PATTERN = r"^NYA-[A-Z]-\d{3}$"  # coded Case ID format: NYA-[Village initial]-[###]
@@ -160,6 +162,9 @@ st.markdown(
     """
 <style>
 .block-container {padding-top: 1.6rem;}
+#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"],
+[data-testid="stAppDeployButton"], .stDeployButton, [class*="viewerBadge"], [class*="_profileContainer"],
+a[href*="github.com"], a[href*="streamlit.io"] {display: none !important; visibility: hidden !important;}
 .kpi {border-left: 5px solid #C99A2E; background: rgba(127,127,127,0.09);
       border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; min-height: 96px;}
 .kpi-l {font-size: 0.78rem; text-transform: uppercase; letter-spacing: .04em; opacity: .75;}
@@ -241,27 +246,35 @@ def schema_from_asset(asset):
 
 
 @st.cache_data(ttl=CACHE_SECONDS, show_spinner="Pulling latest data from KoboToolbox…")
-def fetch_kobo(server, token, uid):
-    headers = {"Authorization": f"Token {token}"}
-    base = server.rstrip("/")
-    a = requests.get(f"{base}/api/v2/assets/{uid}/", params={"format": "json"}, headers=headers, timeout=60)
-    a.raise_for_status()
-    schema = schema_from_asset(a.json())
-    rows, url, params = [], f"{base}/api/v2/assets/{uid}/data/", {"format": "json", "limit": 3000}
-    while url:
-        r = requests.get(url, headers=headers, params=params, timeout=120)
-        r.raise_for_status()
-        j = r.json()
-        rows.extend(j.get("results", []))
-        url, params = j.get("next"), None
-    return pd.DataFrame(rows), schema
-
-
-def read_upload(f):
-    name = str(getattr(f, "name", f)).lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(f)
-    return pd.read_excel(f, sheet_name=0)
+def fetch_kobo(servers, token, uid):
+    """Try each server in turn. Returns (data, schema, server_used, schema_error)."""
+    headers = {"Authorization": f"Token {token}", "Accept": "application/json"}
+    errors = []
+    for base in servers:
+        base = base.rstrip("/")
+        try:
+            schema, schema_err = None, None
+            try:
+                a = requests.get(f"{base}/api/v2/assets/{uid}/", params={"format": "json"}, headers=headers, timeout=60)
+                a.raise_for_status()
+                schema = schema_from_asset(a.json())
+            except Exception as e:  # noqa: BLE001  (form structure is nice-to-have; data is essential)
+                schema_err = f"{type(e).__name__}: {str(e)[:200]}"
+            rows, url, params = [], f"{base}/api/v2/assets/{uid}/data/", {"format": "json", "limit": 3000}
+            while url:
+                r = requests.get(url, headers=headers, params=params, timeout=120)
+                r.raise_for_status()
+                j = r.json()
+                rows.extend(j.get("results", []))
+                url, params = j.get("next"), None
+            return pd.DataFrame(rows), schema, base, schema_err
+        except requests.HTTPError as e:
+            body = (e.response.text or "")[:200].replace("\n", " ") if e.response is not None else ""
+            code = e.response.status_code if e.response is not None else "?"
+            errors.append(f"{base}  ->  HTTP {code} {body}")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{base}  ->  {type(e).__name__}: {str(e)[:200]}")
+    raise RuntimeError("\n".join(errors))
 
 
 def canonicalize(raw, schema=None):
@@ -448,40 +461,27 @@ def followup_table(c2, c3_all, today):
 # SIDEBAR – DATA SOURCE
 # =============================================================================
 st.sidebar.title("👣 Golden Steps CBO")
-configured = "YOUR_" not in str(KOBO_API_TOKEN) and "YOUR_" not in str(KOBO_ASSET_UID)
-source = st.sidebar.radio("Data source", ["KoboToolbox API", "Upload Kobo export"],
-                          index=0 if configured else 1)
 if st.sidebar.button("🔄 Refresh data"):
     st.cache_data.clear()
     st.rerun()
 
-raw, schema = None, None
-if source == "KoboToolbox API":
-    if not configured:
-        st.warning("**KoboToolbox API not configured yet.** Set `KOBO_SERVER`, `KOBO_API_TOKEN` and "
-                   "`KOBO_ASSET_UID` at the top of `app.py` (or in `.streamlit/secrets.toml`), "
-                   "or switch to *Upload Kobo export* in the sidebar to preview with a file.")
-        st.stop()
-    try:
-        raw, schema = fetch_kobo(KOBO_SERVER, KOBO_API_TOKEN, KOBO_ASSET_UID)
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else "?"
-        st.error(f"Kobo API returned HTTP {code}. Check the server URL (kf vs eu), the API token, "
-                 "and that the asset UID is correct and shared with this token's account.")
-        st.stop()
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Could not reach KoboToolbox: {e}")
-        st.stop()
-else:
-    up = st.sidebar.file_uploader("Kobo export (.xlsx / .csv, column headers = labels)", type=["xlsx", "csv"])
-    demo = os.environ.get("GS_DEMO_FILE")
-    if up is not None:
-        raw = read_upload(up)
-    elif demo and os.path.exists(demo):
-        raw = read_upload(demo)
-    else:
-        st.info("Upload a Kobo export in the sidebar to preview the dashboard.")
-        st.stop()
+if not KOBO_API_TOKEN or not KOBO_ASSET_UID or "YOUR_" in str(KOBO_ASSET_UID):
+    st.error("**KoboToolbox is not configured.** Add `KOBO_API_TOKEN` (and optionally `KOBO_ASSET_UID`, "
+             "`KOBO_SERVER`) to `.streamlit/secrets.toml` locally, or to *Settings → Secrets* on Streamlit Cloud.")
+    st.stop()
+
+servers = tuple(dict.fromkeys([str(KOBO_SERVER).rstrip("/")] + KOBO_FALLBACK_SERVERS))
+try:
+    raw, schema, used_server, schema_err = fetch_kobo(servers, str(KOBO_API_TOKEN).strip(), str(KOBO_ASSET_UID).strip())
+except Exception as e:  # noqa: BLE001
+    st.error("Could not load data from KoboToolbox. Details per server:")
+    st.code(str(e))
+    st.caption("401/403 = wrong or revoked API token, or the token's account has no access to this form · "
+               "404 = wrong form ID or wrong server · other = network problem.")
+    st.stop()
+if schema_err:
+    st.warning("Could not read the form structure from Kobo, so some fields may not map correctly "
+               f"({schema_err}).")
 
 if raw is None or raw.empty:
     st.info("The form has no submissions yet.")
@@ -493,6 +493,7 @@ S = split_sections(df)
 today = pd.Timestamp.now(tz=TZ).tz_localize(None).normalize()
 
 with st.sidebar.expander("Field mapping / troubleshooting"):
+    st.caption(f"Server: {used_server}")
     st.caption(f"{len(raw):,} submissions loaded · {len(FIELDS) - len(unmapped)}/{len(FIELDS)} fields mapped.")
     if unmapped:
         st.caption("No matching column for (not in form, or no data yet): " + ", ".join(unmapped))
