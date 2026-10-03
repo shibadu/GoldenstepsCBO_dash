@@ -37,15 +37,35 @@ import streamlit as st
 # =============================================================================
 
 
-def _secret(key, default):
+# Private repos / local use ONLY: you may paste the token between the quotes as a last resort.
+# Never do this if the code is in a public GitHub repo.
+KOBO_API_TOKEN_FALLBACK = ""
+
+
+def _all_secrets():
+    """Flatten st.secrets (incl. one level of [sections]) into {lowercase_key: value}."""
+    flat = {}
     try:
-        return st.secrets[key]
+        for k, v in st.secrets.items():
+            if hasattr(v, "items"):
+                for k2, v2 in v.items():
+                    flat[str(k2).lower()] = v2
+            else:
+                flat[str(k).lower()] = v
     except Exception:
-        return os.environ.get(key, default)
+        pass
+    return flat
+
+
+def _secret(key, default):
+    val = _all_secrets().get(key.lower())
+    if val in (None, ""):
+        val = os.environ.get(key, default)
+    return val.strip().strip("\"'") if isinstance(val, str) else val
 
 
 KOBO_SERVER = _secret("KOBO_SERVER", "https://kf.kobotoolbox.org")  # <-- your Kobo server
-KOBO_API_TOKEN = _secret("KOBO_API_TOKEN", "")  # API key: put in .streamlit/secrets.toml, NOT in this file
+KOBO_API_TOKEN = _secret("KOBO_API_TOKEN", KOBO_API_TOKEN_FALLBACK)  # API key: put in .streamlit/secrets.toml, NOT in this file
 KOBO_ASSET_UID = _secret("KOBO_ASSET_UID", "aJ5SsJRgzQw6UtpNtH63V2")  # form ID (not secret)
 KOBO_FALLBACK_SERVERS = ["https://kf.kobotoolbox.org", "https://eu.kobotoolbox.org",
                          "https://kobo.humanitarianresponse.info"]  # tried automatically if the first fails
@@ -337,9 +357,10 @@ def prepare(df):
         df[k] = df[k].astype("object").map(lambda v: v.strip() if isinstance(v, str) else v).replace("", np.nan)
         if k not in LONG_TEXT:
             df[k] = df[k].map(lambda v: re.sub(r"\s+", " ", v) if isinstance(v, str) else v)
-    df["risk"] = df["risk"].map(lambda v: v.title() if isinstance(v, str) else v)
-    df["cid"] = df["case_id"].map(lambda v: v.upper() if isinstance(v, str) else v)
-    df["acc_cid"] = df["acc_case_id"].map(lambda v: v.upper() if isinstance(v, str) else v)
+        df[k] = df[k].astype("object")  # keep text type even when a column is entirely empty
+    df["risk"] = df["risk"].map(lambda v: v.title() if isinstance(v, str) else v).astype("object")
+    df["cid"] = df["case_id"].map(lambda v: v.upper() if isinstance(v, str) else v).astype("object")
+    df["acc_cid"] = df["acc_case_id"].map(lambda v: v.upper() if isinstance(v, str) else v).astype("object")
     sub = pd.to_datetime(df["_submission_time"], errors="coerce", utc=True)
     df["sub_date"] = sub.dt.tz_convert(TZ).dt.tz_localize(None).dt.normalize()
     return df
@@ -415,7 +436,7 @@ def age_sort_key(v):
 
 
 def is_complete(s):
-    return s.fillna("").str.lower().str.startswith("complete")
+    return s.astype("object").fillna("").astype(str).str.lower().str.startswith("complete")
 
 
 def func_rank(v):
@@ -466,8 +487,22 @@ if st.sidebar.button("🔄 Refresh data"):
     st.rerun()
 
 if not KOBO_API_TOKEN or not KOBO_ASSET_UID or "YOUR_" in str(KOBO_ASSET_UID):
-    st.error("**KoboToolbox is not configured.** Add `KOBO_API_TOKEN` (and optionally `KOBO_ASSET_UID`, "
-             "`KOBO_SERVER`) to `.streamlit/secrets.toml` locally, or to *Settings → Secrets* on Streamlit Cloud.")
+    st.error("**KoboToolbox is not configured** – the app cannot see `KOBO_API_TOKEN`.")
+    try:
+        _err = None
+        _names = sorted(_all_secrets().keys())
+    except Exception as _e:  # noqa: BLE001
+        _err, _names = str(_e), []
+    st.markdown("**Diagnostics (names only, no values):**")
+    st.code(f"secret keys the app can see : {_names or 'NONE'}\n"
+            f"KOBO_API_TOKEN found        : {bool(KOBO_API_TOKEN)}\n"
+            f"KOBO_ASSET_UID found        : {bool(KOBO_ASSET_UID)}\n"
+            f"server                      : {KOBO_SERVER}")
+    st.markdown(
+        "- **NONE** → the secrets file is not being read. On Streamlit Cloud paste it into *Manage app → Settings → Secrets* "
+        "(the local `.streamlit/secrets.toml` is not uploaded). Locally, run `streamlit run app.py` from the folder that contains `.streamlit`.\n"
+        "- Keys listed but not `kobo_api_token` → the name is misspelt.\n"
+        "- Every value must be in quotes, e.g. `KOBO_API_TOKEN = \"abc123\"`; an unquoted value makes the whole secrets file fail to load.")
     st.stop()
 
 servers = tuple(dict.fromkeys([str(KOBO_SERVER).rstrip("/")] + KOBO_FALLBACK_SERVERS))
