@@ -1,0 +1,8 @@
+[client]
+toolbarMode = "minimal"      # hides Deploy / menu items
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
